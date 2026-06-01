@@ -646,6 +646,23 @@ TEST(cypher_func_tointeger_tofloat) {
     PASS();
 }
 
+TEST(cypher_func_size_reverse) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WHERE f.name = \"LogError\" "
+                                "RETURN size(f.name), length(f.name), reverse(f.name)",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "8"); /* "LogError" has 8 chars */
+    ASSERT_STR_EQ(r.rows[0][1], "8");
+    ASSERT_STR_EQ(r.rows[0][2], "rorrEgoL");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_calls_relationship) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -918,25 +935,36 @@ TEST(cypher_exec_count_distinct_issue239) {
     PASS();
 }
 
-/* issue #373: an unsupported computed expression in WITH/RETURN (function call
- * like split(...) or list indexing [..]) must not desync the parser into a
- * misleading default star projection (wrong columns f.name/.../.label, blank
- * rows). The requested column shape is preserved; the unsupported expression
- * projects empty while sibling aggregates still compute. */
-TEST(cypher_exec_unsupported_with_expr_resync_issue373) {
+/* issue #373: an unsupported computed expression in WITH/RETURN (an unknown
+ * function like split(...) or list indexing [..]) must FAIL LOUDLY with a clear
+ * "unsupported function" error rather than silently projecting an empty column
+ * (which looks like a valid-but-blank result and hides the real problem). */
+TEST(cypher_exec_unsupported_func_errors_issue373) {
     cbm_store_t *s = setup_cypher_store();
 
     cbm_cypher_result_t r = {0};
     int rc = cbm_cypher_execute(
         s, "MATCH (f:Function) WITH split(f.name)[0] AS top, count(*) AS c RETURN top, c", "test",
         0, &r);
-    ASSERT_EQ(rc, 0);
-    ASSERT_NULL(r.error);
-    /* Columns are the requested aliases (top, c) — NOT a 3-column star
-     * projection of f.name/f.qualified_name/f.label. */
-    ASSERT_EQ(r.col_count, 2);
-    ASSERT_STR_EQ(r.columns[0], "top");
-    ASSERT_STR_EQ(r.columns[1], "c");
+    ASSERT_TRUE(rc != 0); /* unsupported function now fails loudly */
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_TRUE(strstr(r.error, "unsupported") != NULL);
+    ASSERT_TRUE(strstr(r.error, "split") != NULL);
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A recognised function still works, and an unknown one in plain RETURN errors. */
+TEST(cypher_exec_unknown_func_return_errors) {
+    cbm_store_t *s = setup_cypher_store();
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN nosuchfunc(f.name)", "test", 0, &r);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_TRUE(strstr(r.error, "unsupported function") != NULL);
     cbm_cypher_result_free(&r);
 
     cbm_store_close(s);
@@ -2430,6 +2458,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_func_keys);
     RUN_TEST(cypher_func_properties);
     RUN_TEST(cypher_func_tointeger_tofloat);
+    RUN_TEST(cypher_func_size_reverse);
     RUN_TEST(cypher_exec_calls_relationship);
     RUN_TEST(cypher_exec_calls_with_where);
     RUN_TEST(cypher_exec_inbound);
@@ -2446,7 +2475,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_where_label_test_issue241);
     RUN_TEST(cypher_exec_label_alternation_issue242);
     RUN_TEST(cypher_exec_count_distinct_issue239);
-    RUN_TEST(cypher_exec_unsupported_with_expr_resync_issue373);
+    RUN_TEST(cypher_exec_unsupported_func_errors_issue373);
+    RUN_TEST(cypher_exec_unknown_func_return_errors);
     RUN_TEST(cypher_exec_inline_props);
     RUN_TEST(cypher_parse_where_starts_with);
     RUN_TEST(cypher_parse_where_contains);

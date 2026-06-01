@@ -248,6 +248,13 @@ case "$TIV" in
   *) echo "OK: query_graph toInteger(f.start_line) = $TIV" ;;
 esac
 
+# size() string-length function in projection
+SZV=$(cyp_first_cell 'MATCH (f:Function) RETURN size(f.name) AS s LIMIT 1')
+case "$SZV" in
+  ''|*[!0-9]*) echo "FAIL: query_graph size(f.name) returned non-integer '$SZV'"; exit 1 ;;
+  *) echo "OK: query_graph size(f.name) = $SZV" ;;
+esac
+
 # =~ regex match in WHERE
 CYPHER_RX=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) WHERE f.name =~ \\\".+\\\" RETURN f.name\"}")
 RX_ROWS=$(echo "$CYPHER_RX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")

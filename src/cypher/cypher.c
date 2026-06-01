@@ -1264,14 +1264,25 @@ static bool cyp_ci_eq(const char *a, const char *b) {
  * casts toInteger/toFloat/toBoolean — or NULL if unrecognised (case-insensitive).
  * toLower/toUpper/toString are separate keyword tokens handled elsewhere. */
 static const char *scalar_func_canonical(const char *s) {
-    static const char *const names[] = {"labels",    "type",    "id",        "keys", "properties",
-                                        "toInteger", "toFloat", "toBoolean", NULL};
+    static const char *const names[] = {
+        "labels", "type",   "id",   "keys",  "properties", "toInteger", "toFloat", "toBoolean",
+        "size",   "length", "trim", "ltrim", "rtrim",      "reverse",   NULL};
     for (int i = 0; names[i]; i++) {
         if (cyp_ci_eq(s, names[i])) {
             return names[i];
         }
     }
     return NULL;
+}
+
+/* True for single-argument functions that transform a scalar string value
+ * (vs. entity-introspection funcs that act on the bound node/edge). */
+static bool is_scalar_value_func(const char *f) {
+    return f && (strcmp(f, "toLower") == 0 || strcmp(f, "toUpper") == 0 ||
+                 strcmp(f, "toString") == 0 || strcmp(f, "toInteger") == 0 ||
+                 strcmp(f, "toFloat") == 0 || strcmp(f, "toBoolean") == 0 ||
+                 strcmp(f, "size") == 0 || strcmp(f, "length") == 0 || strcmp(f, "trim") == 0 ||
+                 strcmp(f, "ltrim") == 0 || strcmp(f, "rtrim") == 0 || strcmp(f, "reverse") == 0);
 }
 
 static int parse_var_dot_prop(parser_t *p, cbm_return_item_t *item) {
@@ -1365,28 +1376,26 @@ static int parse_return_item(parser_t *p, cbm_return_item_t *item) {
     if (rc < 0) {
         return CBM_NOT_FOUND;
     }
-    /* An unknown function call / indexed expression after a bare identifier
-     * (e.g. split(f.path,'/')[0]) is not evaluated, but its balanced
-     * parentheses/brackets MUST be consumed so the parser stays in sync. Left
-     * unconsumed, the trailing tokens desynced the parser into a misleading
-     * default star projection (wrong columns, blank rows) (#373). The column
-     * keeps its alias and simply projects empty. */
-    if (!item->func && !item->kase) {
-        while (check(p, TOK_LPAREN) || check(p, TOK_LBRACKET)) {
-            cbm_token_type_t open = peek(p)->type;
-            cbm_token_type_t close = (open == TOK_LPAREN) ? TOK_RPAREN : TOK_RBRACKET;
-            advance(p);
-            int depth = 1;
-            while (depth > 0 && !check(p, TOK_EOF)) {
-                cbm_token_type_t t = peek(p)->type;
-                if (t == open) {
-                    depth++;
-                } else if (t == close) {
-                    depth--;
-                }
-                advance(p);
-            }
+    /* A bare identifier followed by '(' is a function we don't recognise
+     * (recognised aggregates / string funcs / scalar funcs are handled above),
+     * and '[' begins list indexing/slicing we don't support. Rather than
+     * silently projecting an empty column — which looks like a valid but blank
+     * result and hides the real problem — fail loudly with a clear message so
+     * the caller knows the query used an unsupported feature (#373). */
+    if (!item->func && !item->kase && (check(p, TOK_LPAREN) || check(p, TOK_LBRACKET))) {
+        if (check(p, TOK_LPAREN)) {
+            snprintf(p->error, sizeof(p->error),
+                     "unsupported function '%s' (supported: count, sum, avg, min, max, collect, "
+                     "toLower, toUpper, toString, toInteger, toFloat, toBoolean, size, length, "
+                     "trim, ltrim, rtrim, reverse, labels, type, id, keys, properties)",
+                     item->variable ? item->variable : "?");
+        } else {
+            snprintf(p->error, sizeof(p->error),
+                     "unsupported expression: list indexing/slicing '[...]' is not supported");
         }
+        safe_str_free(&item->variable);
+        safe_str_free(&item->property);
+        return CBM_NOT_FOUND;
     }
     /* Optional AS alias */
     if (match(p, TOK_AS)) {
@@ -2427,6 +2436,41 @@ static const char *apply_string_func(const char *func, const char *val, char *bu
         }
         return ""; /* not a boolean → null */
     }
+    if (strcmp(func, "size") == 0 || strcmp(func, "length") == 0) {
+        snprintf(buf, buf_sz, "%zu", strlen(val));
+        return buf;
+    }
+    if (strcmp(func, "trim") == 0 || strcmp(func, "ltrim") == 0 || strcmp(func, "rtrim") == 0) {
+        bool do_left = (strcmp(func, "trim") == 0 || strcmp(func, "ltrim") == 0);
+        bool do_right = (strcmp(func, "trim") == 0 || strcmp(func, "rtrim") == 0);
+        const char *start = val;
+        const char *end = val + strlen(val);
+        while (do_left && (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r')) {
+            start++;
+        }
+        while (do_right && end > start &&
+               (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r')) {
+            end--;
+        }
+        size_t n = (size_t)(end - start);
+        if (n >= buf_sz) {
+            n = buf_sz - SKIP_ONE;
+        }
+        memcpy(buf, start, n);
+        buf[n] = '\0';
+        return buf;
+    }
+    if (strcmp(func, "reverse") == 0) {
+        size_t len = strlen(val);
+        if (len >= buf_sz) {
+            len = buf_sz - SKIP_ONE;
+        }
+        for (size_t i = 0; i < len; i++) {
+            buf[i] = val[len - SKIP_ONE - i];
+        }
+        buf[len] = '\0';
+        return buf;
+    }
     return val;
 }
 
@@ -2952,10 +2996,7 @@ static const char *project_item(binding_t *b, cbm_return_item_t *item, char *fun
         }
     }
     const char *raw = binding_get_virtual(b, item->variable, item->property);
-    if (item->func &&
-        (strcmp(item->func, "toLower") == 0 || strcmp(item->func, "toUpper") == 0 ||
-         strcmp(item->func, "toString") == 0 || strcmp(item->func, "toInteger") == 0 ||
-         strcmp(item->func, "toFloat") == 0 || strcmp(item->func, "toBoolean") == 0)) {
+    if (is_scalar_value_func(item->func)) {
         return apply_string_func(item->func, raw, func_buf, buf_sz);
     }
     return raw;
