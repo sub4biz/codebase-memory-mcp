@@ -87,6 +87,13 @@ struct cbm_gbuf {
     CBMHashTable *edges_by_target_type; /* "tgtID:type" → edge_ptr_array_t* */
     CBMHashTable *edges_by_type;        /* "type" → edge_ptr_array_t* */
 
+    /* String intern pool for highly-repetitive fields (node label/file_path,
+     * edge type). Maps string content → owned canonical copy, collapsing
+     * O(nodes+edges) duplicate allocations to O(distinct). The pool owns the
+     * copies; interned pointers are stable for the buffer lifetime and are NOT
+     * freed by free_node_strings/free_edge_strings — only once in cbm_gbuf_free. */
+    CBMHashTable *intern_pool;
+
     /* Vector storage for semantic embeddings (filled by pass_semantic_edges,
      * consumed by cbm_write_db during dump). */
     CBMDumpVector *dump_vectors;
@@ -103,6 +110,23 @@ struct cbm_gbuf {
 
 static char *heap_strdup(const char *s) {
     return s ? strdup(s) : strdup("{}");
+}
+
+/* Intern a repetitive string into the buffer's pool: identical content collapses
+ * to a single heap copy owned by the pool. NULL maps to "{}" (matches
+ * heap_strdup). The returned pointer is stable for the buffer's lifetime and
+ * must never be freed or mutated by callers. Returns NULL only on OOM. */
+static const char *gb_intern(cbm_gbuf_t *gb, const char *s) {
+    const char *key = s ? s : "{}";
+    const char *found = cbm_ht_get(gb->intern_pool, key);
+    if (found) {
+        return found;
+    }
+    char *copy = strdup(key);
+    if (copy) {
+        cbm_ht_set(gb->intern_pool, copy, copy); /* key == value == owned copy */
+    }
+    return copy;
 }
 
 static void make_id_key(char *buf, size_t bufsz, int64_t id) {
@@ -166,18 +190,17 @@ static void free_key_only(const char *key, void *value, void *ud) {
     free((void *)key);
 }
 
-/* Free a single node's owned strings */
+/* Free a single node's owned strings. label and file_path are interned
+ * (pool-owned) — NOT freed here; the pool frees them once in cbm_gbuf_free. */
 static void free_node_strings(cbm_gbuf_node_t *n) {
-    free(n->label);
     free(n->name);
     free(n->qualified_name);
-    free(n->file_path);
     free(n->properties_json);
 }
 
-/* Free a single edge's owned strings */
+/* Free a single edge's owned strings. type is interned (pool-owned) — NOT
+ * freed here; the pool frees it once in cbm_gbuf_free. */
 static void free_edge_strings(cbm_gbuf_edge_t *e) {
-    free(e->type);
     free(e->properties_json);
 }
 
@@ -368,6 +391,8 @@ cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path) {
     gb->edges_by_target_type = cbm_ht_create(CBM_SZ_256);
     gb->edges_by_type = cbm_ht_create(CBM_SZ_32);
 
+    gb->intern_pool = cbm_ht_create(CBM_SZ_1K);
+
     return gb;
 }
 
@@ -446,6 +471,14 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
         free((void *)gb->dump_token_vecs[i].vector);
     }
     free(gb->dump_token_vecs);
+
+    /* Free interned strings (node label/file_path, edge type) — pool owns one
+     * copy each (key == value), freed exactly once via free_key_only. Done after
+     * nodes/edges since they borrowed these pointers. */
+    if (gb->intern_pool) {
+        cbm_ht_foreach(gb->intern_pool, free_key_only, NULL);
+        cbm_ht_free(gb->intern_pool);
+    }
 
     free(gb->project);
     free(gb->root_path);
@@ -552,18 +585,16 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
     /* Check if node already exists */
     cbm_gbuf_node_t *existing = cbm_ht_get(gb->node_by_qn, qualified_name);
     if (existing) {
-        /* Update in-place. Strdup new values BEFORE freeing old ones,
-         * because callers may pass existing->label etc. as arguments. */
-        char *new_label = heap_strdup(label);
+        /* Update in-place. name/properties are strdup'd BEFORE freeing old ones
+         * (callers may pass existing->name as an argument). label/file_path are
+         * interned: gb_intern returns a stable pool pointer (idempotent even when
+         * label == existing->label), so the old value is replaced, never freed. */
         char *new_name = heap_strdup(name);
-        char *new_file = heap_strdup(file_path);
         char *new_props = properties_json ? heap_strdup(properties_json) : NULL;
-        free(existing->label);
-        existing->label = new_label;
+        existing->label = (char *)gb_intern(gb, label);
         free(existing->name);
         existing->name = new_name;
-        free(existing->file_path);
-        existing->file_path = new_file;
+        existing->file_path = (char *)gb_intern(gb, file_path);
         existing->start_line = start_line;
         existing->end_line = end_line;
         if (new_props) {
@@ -582,10 +613,10 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
     int64_t id = alloc_next_id(gb);
     node->id = id;
     node->project = gb->project;
-    node->label = heap_strdup(label);
+    node->label = (char *)gb_intern(gb, label);
     node->name = heap_strdup(name);
     node->qualified_name = heap_strdup(qualified_name);
-    node->file_path = heap_strdup(file_path);
+    node->file_path = (char *)gb_intern(gb, file_path);
     node->start_line = start_line;
     node->end_line = end_line;
     node->properties_json = heap_strdup(properties_json);
@@ -897,7 +928,7 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
     edge->project = gb->project;
     edge->source_id = source_id;
     edge->target_id = target_id;
-    edge->type = heap_strdup(type);
+    edge->type = (char *)gb_intern(gb, type);
     edge->properties_json = heap_strdup(properties_json);
 
     /* Store pointer in array */
@@ -1014,15 +1045,14 @@ static void free_remap_entry(const char *key, void *val, void *ud) {
     free(val);
 }
 
-/* Handle QN collision: update dst node fields (src wins), record remap if IDs differ. */
-static void merge_update_existing(cbm_gbuf_node_t *existing, const cbm_gbuf_node_t *sn,
-                                  CBMHashTable **remap) {
-    free(existing->label);
-    existing->label = heap_strdup(sn->label);
+/* Handle QN collision: update dst node fields (src wins), record remap if IDs differ.
+ * label/file_path are re-interned into dst's pool (sn's pointers belong to src). */
+static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
+                                  const cbm_gbuf_node_t *sn, CBMHashTable **remap) {
+    existing->label = (char *)gb_intern(dst, sn->label);
     free(existing->name);
     existing->name = heap_strdup(sn->name);
-    free(existing->file_path);
-    existing->file_path = heap_strdup(sn->file_path);
+    existing->file_path = (char *)gb_intern(dst, sn->file_path);
     existing->start_line = sn->start_line;
     existing->end_line = sn->end_line;
     if (sn->properties_json) {
@@ -1051,10 +1081,10 @@ static void merge_copy_new_node(cbm_gbuf_t *dst, const cbm_gbuf_node_t *sn) {
 
     node->id = sn->id;
     node->project = dst->project;
-    node->label = heap_strdup(sn->label);
+    node->label = (char *)gb_intern(dst, sn->label);
     node->name = heap_strdup(sn->name);
     node->qualified_name = heap_strdup(sn->qualified_name);
-    node->file_path = heap_strdup(sn->file_path);
+    node->file_path = (char *)gb_intern(dst, sn->file_path);
     node->start_line = sn->start_line;
     node->end_line = sn->end_line;
     node->properties_json = heap_strdup(sn->properties_json);
@@ -1119,7 +1149,7 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
 
         cbm_gbuf_node_t *existing = cbm_ht_get(dst->node_by_qn, sn->qualified_name);
         if (existing) {
-            merge_update_existing(existing, sn, &remap);
+            merge_update_existing(dst, existing, sn, &remap);
         } else {
             merge_copy_new_node(dst, sn);
         }
