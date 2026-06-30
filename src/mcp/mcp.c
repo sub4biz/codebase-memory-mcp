@@ -885,6 +885,22 @@ static const char *project_db_path(const char *project, char *buf, size_t bufsz)
 
 /* ── Store resolution ──────────────────────────────────────────── */
 
+/* Read the sole INTERNAL project name from a .db file at full_path.
+ * Opens the file query-mode (no create) and succeeds ONLY when the db holds
+ * exactly one project row with a non-empty name — this filters ghost/empty
+ * /corrupt dbs (0-byte file, missing `projects` table, or >1 row). On success
+ * the internal name is copied into name_out; if out_store is non-NULL the open
+ * handle is transferred to the caller (who must cbm_store_close it). On failure
+ * the store is always closed. Defined after is_project_db_file below. */
+static bool db_internal_project_name(const char *full_path, char *name_out, size_t name_sz,
+                                     cbm_store_t **out_store);
+
+/* #704 fallback: scan the cache dir for the db whose sole internal project name
+ * equals `project`, returning an open store handle (caller owns it) or NULL.
+ * Used only when <project>.db is absent or its internal name differs from the
+ * passed name (drifted filename). Defined after is_project_db_file below. */
+static cbm_store_t *resolve_store_fallback_scan(const char *project);
+
 /* Open the right project's .db file for query tools.
  * Caches the connection — reopens only when project changes.
  * Tracks last-access time so the event loop can evict idle stores. */
@@ -941,12 +957,29 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
          * Linux where unlink defers actual removal). Opening an empty/deleted
          * store without closing it leaks the SQLite connection. */
         cbm_project_t proj_verify = {0};
-        if (cbm_store_get_project(srv->store, project, &proj_verify) != CBM_STORE_OK) {
-            cbm_store_close(srv->store);
-            srv->store = NULL;
-            return NULL;
+        if (cbm_store_get_project(srv->store, project, &proj_verify) == CBM_STORE_OK) {
+            cbm_project_free_fields(&proj_verify);
+            srv->owns_store = true;
+            free(srv->current_project);
+            srv->current_project = heap_strdup(project);
+            return srv->store; /* fast path: filename == internal name */
         }
-        cbm_project_free_fields(&proj_verify);
+        /* #704: <project>.db exists but its INTERNAL project name differs from
+         * the passed name (a copied/renamed db, or a legacy '.'-vs-'-' username
+         * twin). Close it and fall through to the cache-dir scan below. */
+        cbm_store_close(srv->store);
+        srv->store = NULL;
+    }
+
+    /* #704 fallback: either <project>.db is absent or its internal name drifted
+     * from its filename. Node rows are keyed on the INTERNAL name (== the passed
+     * name, since list_projects now advertises internal names), so scan the
+     * cache dir for the db whose sole internal project name equals `project` and
+     * adopt it. Runs ONLY on the fallback — the common fast path is unchanged.
+     * No match → NULL (a genuine typo stays not-found). */
+    cbm_store_t *scanned = resolve_store_fallback_scan(project);
+    if (scanned) {
+        srv->store = scanned;
         srv->owns_store = true;
         free(srv->current_project);
         srv->current_project = heap_strdup(project);
@@ -977,12 +1010,21 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
         if (!is_project_db_file(n, len)) {
             continue;
         }
+        /* #704: advertise the db's INTERNAL project name, not its filename, and
+         * skip ghost/empty/corrupt dbs — so the hint lists names the user can
+         * actually pass to resolve a store. */
+        char full_path[CBM_SZ_2K];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, n);
+        char iname[CBM_SZ_1K];
+        if (!db_internal_project_name(full_path, iname, sizeof(iname), NULL)) {
+            continue;
+        }
         if ((size_t)offset >= out_sz)
             break; /* bounds check before write */
         if (count > 0 && offset < (int)out_sz - MCP_SEPARATOR) {
             out[offset++] = ',';
         }
-        int wrote = snprintf(out + offset, out_sz - (size_t)offset, "\"%.*s\"", (int)(len - 3), n);
+        int wrote = snprintf(out + offset, out_sz - (size_t)offset, "\"%s\"", iname);
         if (wrote > 0) {
             offset += wrote;
             if ((size_t)offset >= out_sz) {
@@ -1081,34 +1123,96 @@ static bool is_project_db_file(const char *name, size_t len) {
     return true;
 }
 
+/* db_internal_project_name — see forward declaration above resolve_store. */
+static bool db_internal_project_name(const char *full_path, char *name_out, size_t name_sz,
+                                     cbm_store_t **out_store) {
+    if (out_store) {
+        *out_store = NULL;
+    }
+    cbm_store_t *st = cbm_store_open_path_query(full_path);
+    if (!st) {
+        return false; /* nonexistent / unreadable */
+    }
+    cbm_project_t *projs = NULL;
+    int n = 0;
+    bool ok = false;
+    if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK && n == 1 && projs[0].name &&
+        projs[0].name[0]) {
+        snprintf(name_out, name_sz, "%s", projs[0].name);
+        ok = true;
+    }
+    cbm_store_free_projects(projs, n);
+    if (ok && out_store) {
+        *out_store = st; /* transfer ownership to caller */
+    } else {
+        cbm_store_close(st);
+    }
+    return ok;
+}
+
+/* resolve_store_fallback_scan — see forward declaration above resolve_store. */
+static cbm_store_t *resolve_store_fallback_scan(const char *project) {
+    char dir_path[CBM_SZ_1K];
+    cache_dir(dir_path, sizeof(dir_path));
+    cbm_dir_t *d = cbm_opendir(dir_path);
+    if (!d) {
+        return NULL;
+    }
+    cbm_store_t *found = NULL;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        const char *n = entry->name;
+        size_t len = strlen(n);
+        if (!is_project_db_file(n, len)) {
+            continue;
+        }
+        char full_path[CBM_SZ_2K];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, n);
+        char iname[CBM_SZ_1K];
+        cbm_store_t *st = NULL;
+        if (db_internal_project_name(full_path, iname, sizeof(iname), &st)) {
+            if (strcmp(iname, project) == 0) {
+                found = st; /* adopt — caller takes ownership */
+                break;
+            }
+            cbm_store_close(st);
+        }
+    }
+    cbm_closedir(d);
+    return found;
+}
+
 /* Open a .db file briefly, collect node/edge counts and root_path,
  * then append a JSON entry to arr. */
 static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *dir_path,
                                      const char *name, size_t name_len, int64_t size_bytes) {
-    char project_name[CBM_SZ_1K];
-    snprintf(project_name, sizeof(project_name), "%.*s", (int)(name_len - 3), name);
+    (void)name_len;
 
     char full_path[CBM_SZ_2K];
     snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
 
-    cbm_store_t *pstore = cbm_store_open_path(full_path);
-    int nodes = 0;
-    int edges = 0;
-    char root_path_buf[CBM_SZ_1K] = "";
-    if (pstore) {
-        nodes = cbm_store_count_nodes(pstore, project_name);
-        edges = cbm_store_count_edges(pstore, project_name);
-        cbm_project_t proj = {0};
-        if (cbm_store_get_project(pstore, project_name, &proj) == CBM_STORE_OK) {
-            if (proj.root_path) {
-                snprintf(root_path_buf, sizeof(root_path_buf), "%s", proj.root_path);
-            }
-            safe_str_free(&proj.name);
-            safe_str_free(&proj.indexed_at);
-            safe_str_free(&proj.root_path);
-        }
-        cbm_store_close(pstore);
+    /* #704: key on the db's INTERNAL project name, not its filename. Node/edge
+     * rows are tagged with the internal name, so a drifted filename (copied or
+     * renamed db, legacy '.'-vs-'-' username twin) would otherwise report 0
+     * nodes/edges and be unresolvable. Skip ghost/empty/corrupt dbs entirely so
+     * they don't appear as resolvable projects. */
+    char project_name[CBM_SZ_1K];
+    cbm_store_t *pstore = NULL;
+    if (!db_internal_project_name(full_path, project_name, sizeof(project_name), &pstore)) {
+        return; /* ghost / unreadable — not a resolvable project */
     }
+
+    int nodes = cbm_store_count_nodes(pstore, project_name);
+    int edges = cbm_store_count_edges(pstore, project_name);
+    char root_path_buf[CBM_SZ_1K] = "";
+    cbm_project_t proj = {0};
+    if (cbm_store_get_project(pstore, project_name, &proj) == CBM_STORE_OK) {
+        if (proj.root_path) {
+            snprintf(root_path_buf, sizeof(root_path_buf), "%s", proj.root_path);
+        }
+        cbm_project_free_fields(&proj);
+    }
+    cbm_store_close(pstore);
 
     yyjson_mut_val *p = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_strcpy(doc, p, "name", project_name);

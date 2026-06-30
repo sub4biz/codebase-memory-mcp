@@ -2358,15 +2358,23 @@ TEST(tool_bad_project_name_no_overflow_issue235) {
     char *saved_copy = saved ? strdup(saved) : NULL;
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
 
-    /* 40 * ~130-char names overflows the 4 KB available-projects buffer. */
+    /* 40 * ~120-char names overflows the 4 KB available-projects buffer.
+     * collect_db_project_names advertises each db's INTERNAL project name
+     * (#704), so the fixture must hold valid dbs with long internal names —
+     * not stub files — for the bounds-check path to actually be exercised. */
     enum { ISSUE235_N = 40 };
     for (int i = 0; i < ISSUE235_N; i++) {
         char name[512];
         ISSUE235_DBNAME(name, cache, i);
-        FILE *fp = fopen(name, "w");
-        if (fp) {
-            fputc('x', fp);
-            fclose(fp);
+        char iname[256];
+        snprintf(iname, sizeof(iname),
+                 "proj_%02d_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                 i);
+        cbm_store_t *st = cbm_store_open_path(name);
+        if (st) {
+            cbm_store_upsert_project(st, iname, cache);
+            cbm_store_close(st);
         }
     }
 
@@ -2391,11 +2399,185 @@ TEST(tool_bad_project_name_no_overflow_issue235) {
         char name[512];
         ISSUE235_DBNAME(name, cache, i);
         cbm_unlink(name);
+        char side[540];
+        snprintf(side, sizeof(side), "%s-wal", name);
+        cbm_unlink(side);
+        snprintf(side, sizeof(side), "%s-shm", name);
+        cbm_unlink(side);
     }
     cbm_rmdir(cache);
     PASS();
 }
 #undef ISSUE235_DBNAME
+
+/* ── #704: project resolution must key on the db's INTERNAL project name ──
+ *
+ * Issue #704: project resolution is registry-less and filename-addressed.
+ * resolve_store() opens <cache>/<passed>.db and then requires the internal
+ * `projects.name` row to equal the passed name; list_projects /
+ * collect_db_project_names derive the advertised name from the .db FILENAME.
+ * When a db's filename != its internal name (a legacy '.'-vs-'-' username
+ * twin, or a copied/renamed file) it shows up in list_projects under the
+ * filename, but every query returns "project not found" — node rows are
+ * tagged with the INTERNAL name, so neither the filename nor the resolve
+ * path lines up. The fix makes list + resolve both key on the INTERNAL name.
+ *
+ * Reproduce-first fixture in an isolated CBM_CACHE_DIR:
+ *   - alpha704.db  : filename == internal name "alpha704"   (control / fast path)
+ *   - gamma704.db  : internal name "beta704"                (DRIFT: built as
+ *                    beta704.db then renamed → filename != internal name)
+ *   - ghost704.db  : 0-byte file                            (ghost / unresolvable)
+ *
+ * RED on buggy code / GREEN on the fix:
+ *   A. list_projects advertises "beta704" (internal), NOT "gamma704" (filename),
+ *      and NOT "ghost704" (0-byte filtered).
+ *   B. search_graph(project="beta704") resolves via the cache-dir scan and
+ *      returns the node — not the "project not found" error.
+ *   C. control project "alpha704" still resolves on the fast path.
+ *   D. the 0-byte ghost is not resolvable.
+ *   E. addressing the drifted db by its FILENAME ("gamma704") stays not-found
+ *      (we key on the internal name, never the file on disk).
+ */
+
+/* Create a file-backed project db at <dir>/<filename> whose INTERNAL project
+ * name is `internal` (which may differ from the filename), holding one
+ * Function node named `fn`. Returns true on success. */
+static bool issue704_make_db(const char *dir, const char *filename, const char *internal,
+                             const char *fn) {
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s", dir, filename);
+    cbm_store_t *st = cbm_store_open_path(path);
+    if (!st) {
+        return false;
+    }
+    bool ok = (cbm_store_upsert_project(st, internal, dir) == CBM_STORE_OK);
+    if (ok) {
+        char qn[256];
+        snprintf(qn, sizeof(qn), "%s.%s", internal, fn);
+        cbm_node_t n = {0};
+        n.project = internal;
+        n.label = "Function";
+        n.name = fn;
+        n.qualified_name = qn;
+        n.file_path = "main.go";
+        n.start_line = 1;
+        n.end_line = 2;
+        ok = (cbm_store_upsert_node(st, &n) > 0);
+    }
+    cbm_store_close(st);
+    return ok;
+}
+
+TEST(tool_resolve_store_by_internal_name_issue704) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-issue704-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS(); /* skip if mkdtemp fails — not a #704 signal */
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    /* (1) control: filename == internal name */
+    ASSERT_TRUE(issue704_make_db(cache, "alpha704.db", "alpha704", "alphaFunc704"));
+
+    /* (2) DRIFT: build beta704.db (internal "beta704") then rename the file to
+     *     gamma704.db, so filename "gamma704" != internal "beta704". */
+    ASSERT_TRUE(issue704_make_db(cache, "beta704.db", "beta704", "betaFunc704"));
+    char beta_path[700];
+    char gamma_path[700];
+    snprintf(beta_path, sizeof(beta_path), "%s/beta704.db", cache);
+    snprintf(gamma_path, sizeof(gamma_path), "%s/gamma704.db", cache);
+    ASSERT_EQ(rename(beta_path, gamma_path), 0);
+
+    /* (3) ghost: 0-byte db file */
+    char ghost_path[700];
+    snprintf(ghost_path, sizeof(ghost_path), "%s/ghost704.db", cache);
+    FILE *gp = fopen(ghost_path, "w");
+    ASSERT_NOT_NULL(gp);
+    fclose(gp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* ── A: list_projects reports INTERNAL names; filters the ghost ── */
+    char *list =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}");
+    ASSERT_NOT_NULL(list);
+    ASSERT_NOT_NULL(strstr(list, "alpha704")); /* control */
+    ASSERT_NOT_NULL(strstr(list, "beta704"));  /* internal name of drifted db (RED before) */
+    ASSERT_NULL(strstr(list, "gamma704"));     /* filename must NOT be advertised (RED before) */
+    ASSERT_NULL(strstr(list, "ghost704"));     /* 0-byte ghost filtered (RED before) */
+    free(list);
+
+    /* ── B: the drifted project resolves by its INTERNAL name ──────── */
+    char *q_beta = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"beta704\",\"name_pattern\":\"betaFunc704\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(q_beta);
+    ASSERT_NOT_NULL(strstr(q_beta, "betaFunc704")); /* resolved + returned node (RED before) */
+    ASSERT_NULL(strstr(q_beta, "not found"));       /* not the not-found error */
+    free(q_beta);
+
+    /* ── C: control project still resolves on the fast path ────────── */
+    char *q_alpha = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"alpha704\",\"name_pattern\":\"alphaFunc704\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(q_alpha);
+    ASSERT_NOT_NULL(strstr(q_alpha, "alphaFunc704"));
+    free(q_alpha);
+
+    /* ── D: the 0-byte ghost is NOT resolvable ─────────────────────── */
+    char *q_ghost = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"ghost704\",\"name_pattern\":\".*\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(q_ghost);
+    ASSERT_NOT_NULL(strstr(q_ghost, "not found"));
+    free(q_ghost);
+
+    /* ── E: addressing the drifted db by its FILENAME stays not-found ── */
+    char *q_gamma = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"gamma704\",\"name_pattern\":\".*\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(q_gamma);
+    ASSERT_NOT_NULL(strstr(q_gamma, "not found"));
+    free(q_gamma);
+
+    cbm_mcp_server_free(srv);
+
+    /* ── cleanup ───────────────────────────────────────────────────── */
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    char a_path[700];
+    snprintf(a_path, sizeof(a_path), "%s/alpha704.db", cache);
+    char corrupt_path[720];
+    snprintf(corrupt_path, sizeof(corrupt_path), "%s.corrupt", ghost_path);
+    cbm_unlink(a_path);
+    cbm_unlink(gamma_path);
+    cbm_unlink(ghost_path);
+    cbm_unlink(corrupt_path); /* ghost may be quarantined by resolve_store */
+    char side[740];
+    snprintf(side, sizeof(side), "%s-wal", a_path);
+    cbm_unlink(side);
+    snprintf(side, sizeof(side), "%s-shm", a_path);
+    cbm_unlink(side);
+    snprintf(side, sizeof(side), "%s-wal", gamma_path);
+    cbm_unlink(side);
+    snprintf(side, sizeof(side), "%s-shm", gamma_path);
+    cbm_unlink(side);
+    cbm_rmdir(cache);
+    PASS();
+}
 
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
@@ -2548,4 +2730,5 @@ SUITE(mcp) {
     RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(snippet_source_invalid_utf8);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
+    RUN_TEST(tool_resolve_store_by_internal_name_issue704);
 }
