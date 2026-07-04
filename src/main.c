@@ -31,8 +31,6 @@ enum {
     MAIN_MAX_PORT = 65536,
     PARENT_WATCHDOG_STACK_SIZE = 64 * CBM_SZ_1K, /* watchdog only polls — tiny stack suffices */
 };
-#define MAIN_RAM_FRACTION 0.5
-
 #define SLEN(s) (sizeof(s) - 1)
 #include "foundation/log.h"
 #include "foundation/diagnostics.h"
@@ -170,6 +168,23 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
     }
 
     cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
+
+    /* #832: route the re-index through the supervised worker subprocess so this
+     * long-lived server process hands its RSS back to the OS on every cycle
+     * instead of ratcheting (mimalloc v3 does not reclaim pages that worker
+     * threads abandon at exit). The child writes the DB; the parent only needs the
+     * return code. The pipeline lock (already held) still serialises re-indexes.
+     * Degrade to the in-process pipeline when the supervisor is off (kill switch)
+     * or the spawn fails. */
+    if (cbm_index_supervisor_should_wrap()) {
+        char *resp = cbm_mcp_index_run_supervised_path(root_path);
+        if (resp) {
+            free(resp);
+            cbm_pipeline_unlock();
+            return 0;
+        }
+        /* resp == NULL → spawn-failure degrade → fall through to in-process. */
+    }
 
     cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
     if (!p) {
@@ -518,11 +533,11 @@ static int handle_subcommand(int argc, char **argv) {
             return 0;
         }
         if (strcmp(argv[i], "cli") == 0) {
-            cbm_mem_init(MAIN_RAM_FRACTION);
+            cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
             return run_cli(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "hook-augment") == 0) {
-            cbm_mem_init(MAIN_RAM_FRACTION);
+            cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
             return cbm_cmd_hook_augment();
         }
         if (strcmp(argv[i], "install") == 0) {
@@ -626,9 +641,7 @@ int main(int argc, char **argv) {
 #endif
 
     /* Default: MCP server on stdio */
-    cbm_mem_init(MAIN_RAM_FRACTION); /* 50% of RAM — safe now because mimalloc tracks ALL
-                                      * memory (C + C++ allocations) via global override.
-                                      * No more untracked heap blind spots. */
+    cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
     /* Store binary path for subprocess spawning + hook log sink */
     cbm_http_server_set_binary_path(argv[0]);
     cbm_log_set_sink_ex(cbm_ui_log_append, CBM_LOG_SINK_TEE);

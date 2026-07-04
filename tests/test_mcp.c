@@ -4169,6 +4169,162 @@ TEST(index_supervisor_gate_requires_marked_host_issue845) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  #832 — background auto-index + watcher re-index must run in the
+ *         supervised worker SUBPROCESS (RSS isolation)
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* The long-lived server ran the full index pipeline in-process on two background
+ * paths (session auto-index in mcp.c, watcher re-index in main.c). Worker-thread
+ * mimalloc heaps abandon pages at thread exit and mimalloc v3
+ * (page_reclaim_on_free=0) does not reclaim them when the main thread later frees
+ * their blocks, so RSS ratchets across re-index cycles (#832). The fix routes both
+ * paths through cbm_mcp_index_run_supervised_path() — the SAME supervised worker
+ * subprocess the index_repository tool uses — so the child hands 100%% of its RSS
+ * back to the OS on exit.
+ *
+ * This guard proves the ROUTING: on a supervisor-marked host with the kill switch
+ * OFF, the shared entry the watcher/auto-index now call must (a) spawn a worker
+ * child (cbm_index_supervisor_spawn_count() increases) and (b) actually index the
+ * fixture (the worker child writes the Function node). RED on the unfixed
+ * in-process routing: it calls cbm_pipeline_run directly, so spawn_count is
+ * unchanged → IDX832_NO_SPAWN. */
+enum {
+    IDX832_OK = 0,
+    IDX832_NO_SPAWN = 51,    /* spawn_count unchanged — routed in-process (RED) */
+    IDX832_NULL_RESP = 52,   /* supervised entry degraded to NULL */
+    IDX832_NOT_INDEXED = 53, /* response/store lacks the indexed Function node */
+    IDX832_SERVER_FAIL = 54,
+};
+
+#ifndef _WIN32 /* helper used only by the POSIX fork harness below */
+static int idx832_supervised_route_check(const char *repo_dir) {
+    /* Become a supervisor host with the kill switch OFF — exactly the real MCP
+     * server's state. Done in the FORKED CHILD only (see the harness) so the
+     * parent test-runner's process-wide host mark stays clear and the #845
+     * unmarked-embedder guard is unaffected. Bound the recovery loop + worker
+     * quiet-timeout so a stuck child cannot run long under the fork+alarm net. */
+    cbm_index_supervisor_mark_host();
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "1", 1);
+    cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
+
+    int spawns_before = cbm_index_supervisor_spawn_count();
+    char *resp = cbm_mcp_index_run_supervised_path(repo_dir);
+    int spawns_after = cbm_index_supervisor_spawn_count();
+
+    if (spawns_after == spawns_before) {
+        free(resp);
+        return IDX832_NO_SPAWN; /* the discriminating assertion: RED in-process */
+    }
+    if (!resp) {
+        return IDX832_NULL_RESP;
+    }
+    bool indexed = response_contains_json_fragment(resp, "\"status\":\"indexed\"");
+    free(resp);
+    if (!indexed) {
+        return IDX832_NOT_INDEXED;
+    }
+
+    /* Store-level proof the worker child did real work: the Function node it wrote
+     * must be queryable from a fresh server reading the DB the child produced. */
+    char *project = cbm_project_name_from_path(repo_dir);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        free(project);
+        return IDX832_SERVER_FAIL;
+    }
+    int code = IDX832_OK;
+    if (project) {
+        char q[512];
+        snprintf(q, sizeof(q),
+                 "{\"project\":\"%s\",\"name_pattern\":\"idx832_fn\",\"label\":\"Function\"}",
+                 project);
+        char *sr = cbm_mcp_handle_tool(srv, "search_graph", q);
+        if (!sr || !strstr(sr, "idx832_fn")) {
+            code = IDX832_NOT_INDEXED;
+        }
+        free(sr);
+    }
+    cbm_mcp_server_free(srv);
+    free(project);
+    return code;
+}
+#endif /* !_WIN32 */
+
+TEST(index_bg_paths_route_through_supervisor_issue832) {
+#ifdef _WIN32
+    /* The guard marks the process as a supervisor host, which cannot be undone.
+     * POSIX isolates that in a forked child; without fork we would pollute the
+     * shared test-runner (breaking the #845 unmarked-embedder guard). The routing
+     * logic is platform-independent and covered on POSIX CI; Windows containment
+     * is covered by the end-to-end crash-containment test. */
+    SKIP_PLATFORM("supervisor-host guard needs fork isolation (POSIX-only)");
+#else
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idx832-repo-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        PASS();
+    }
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-idx832-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        cbm_rmdir(tmp_dir);
+        PASS();
+    }
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1); /* inherited by the worker child */
+
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("def idx832_fn():\n    return 'ok'\n", fp);
+    fclose(fp);
+
+    int code = -1;
+    bool signalled = false;
+    int sig = 0;
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(60); /* a stuck worker dies here instead of hanging the runner */
+        _exit(idx832_supervised_route_check(tmp_dir));
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        signalled = true;
+        sig = WTERMSIG(status);
+    }
+
+    char *project = cbm_project_name_from_path(tmp_dir);
+    cleanup_project_db(cache, project);
+    free(project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    remove(src_path);
+    cbm_rmdir(cache);
+    cbm_rmdir(tmp_dir);
+
+    if (signalled) {
+        printf("    child killed by signal %d (alarm => worker hang)\n", sig);
+    } else if (code != IDX832_OK) {
+        printf("    child exit code %d (51=no spawn/in-process=RED, 52=null resp, "
+               "53=not indexed, 54=server fail)\n",
+               code);
+    }
+    ASSERT_FALSE(signalled);
+    ASSERT_EQ(code, IDX832_OK);
+    PASS();
+#endif
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  AUTO_WATCH GATE  (distilled from PR #625)
  *
  *  Background watcher registration on session connect is gated by the
@@ -4284,6 +4440,185 @@ TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
     }
     ASSERT_EQ(count, 0);
     PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  #853 — auto_watch=false must ALSO gate the SUPERVISED fresh-index
+ *          watcher registration (keystone × #849 merge interaction)
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* #849 routed ALL watcher registration through register_watcher_if_enabled()
+ * (auto_watch gate). The #832 keystone then added a SECOND registration site in
+ * autoindex_thread's supervised-success branch, but wired it as a DIRECT
+ * cbm_watcher_watch() guarded only by `if (srv->watcher)` — srv->watcher is set
+ * unconditionally, so that guard does NOT honour `config set auto_watch false`.
+ * The above tests only cover the already-indexed on-connect path
+ * (register_watcher_if_enabled); this guard covers the fresh-index SUPERVISED
+ * autoindex_thread branch that #832 introduced.
+ *
+ * Drive the real public entry initialize → maybe_auto_index → autoindex_thread on
+ * a supervisor-marked host (kill switch off) with a FRESH project (no prior .db)
+ * and auto_watch=false. cbm_mcp_server_free() joins the autoindex thread, so the
+ * (buggy or gated) registration decision has run before we read the watch count.
+ *
+ * RED on the unfixed ungated block: the supervised success branch calls
+ * cbm_watcher_watch() unconditionally → watch_count == 1 → IDX853_WATCHER_REGISTERED.
+ * GREEN once it calls register_watcher_if_enabled() → auto_watch_off skip → 0.
+ * spawn_count is asserted to have advanced so the assertion cannot pass vacuously
+ * (i.e. green only because the supervised branch was never entered). */
+enum {
+    IDX853_OK = 0,                  /* watch_count==0, supervised branch ran → GREEN */
+    IDX853_WATCHER_REGISTERED = 61, /* watch_count==1 → RED: ungated cbm_watcher_watch */
+    IDX853_NO_SPAWN = 62,           /* spawn_count unchanged → supervised path not exercised */
+    IDX853_SETUP_FAIL = 63,         /* config/watcher/server/cwd setup failed */
+    IDX853_BAD_COUNT = 64,          /* unexpected watch_count (<0 or >1) */
+};
+
+#ifndef _WIN32 /* helper used only by the POSIX fork harness below */
+static int idx853_supervised_autowatch_check(const char *repo_dir, const char *cache_dir) {
+    /* Become a supervisor host with the kill switch OFF — the real prod MCP
+     * server's state. Done in the FORKED CHILD only (see harness) so the parent
+     * test-runner's process-wide host mark stays clear (#845 invariant). Bound the
+     * worker so a stuck spawn cannot run long under the fork+alarm net. */
+    cbm_index_supervisor_mark_host();
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "1", 1);
+    cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
+
+    cbm_config_t *cfg = cbm_config_open(cache_dir);
+    cbm_store_t *wstore = cbm_store_open_memory();
+    cbm_watcher_t *watcher = wstore ? cbm_watcher_new(wstore, NULL, NULL) : NULL;
+    if (!cfg || !watcher) {
+        if (watcher) {
+            cbm_watcher_free(watcher);
+        }
+        if (wstore) {
+            cbm_store_close(wstore);
+        }
+        if (cfg) {
+            cbm_config_close(cfg);
+        }
+        return IDX853_SETUP_FAIL;
+    }
+    /* auto_index=true → maybe_auto_index launches autoindex_thread for the fresh
+     * project; auto_watch=false → the gate this guard exercises. */
+    cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
+    cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, "false");
+
+    /* detect_session derives session_root/session_project from the cwd. */
+    char old_cwd[1024];
+    if (!cbm_getcwd(old_cwd, sizeof(old_cwd)) || cbm_chdir(repo_dir) != 0) {
+        cbm_watcher_free(watcher);
+        cbm_store_close(wstore);
+        cbm_config_close(cfg);
+        return IDX853_SETUP_FAIL;
+    }
+
+    int spawns_before = cbm_index_supervisor_spawn_count();
+    int code = IDX853_SETUP_FAIL;
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (srv) {
+        cbm_mcp_server_set_watcher(srv, watcher);
+        cbm_mcp_server_set_config(srv, cfg);
+        char *resp = cbm_mcp_server_handle(
+            srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+        free(resp);
+        /* free() joins the autoindex thread → the supervised worker has finished
+         * and the registration decision (buggy or gated) has executed. */
+        cbm_mcp_server_free(srv);
+
+        int spawns_after = cbm_index_supervisor_spawn_count();
+        int watch_count = cbm_watcher_watch_count(watcher);
+
+        if (spawns_after == spawns_before) {
+            code = IDX853_NO_SPAWN; /* supervised branch never ran — not a valid probe */
+        } else if (watch_count == 1) {
+            code = IDX853_WATCHER_REGISTERED; /* the discriminating RED assertion */
+        } else if (watch_count == 0) {
+            code = IDX853_OK;
+        } else {
+            code = IDX853_BAD_COUNT;
+        }
+    }
+
+    (void)cbm_chdir(old_cwd);
+    cbm_watcher_free(watcher);
+    cbm_store_close(wstore);
+    cbm_config_close(cfg);
+    return code;
+}
+#endif /* !_WIN32 */
+
+TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853) {
+#ifdef _WIN32
+    /* Marks the process as a supervisor host (irreversible); POSIX isolates that
+     * in a forked child. The gate logic is platform-independent and covered on
+     * POSIX CI. */
+    SKIP_PLATFORM("supervisor-host guard needs fork isolation (POSIX-only)");
+#else
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idx853-repo-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        PASS();
+    }
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-idx853-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        cbm_rmdir(tmp_dir);
+        PASS();
+    }
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1); /* inherited by the worker child */
+
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("def idx853_fn():\n    return 'ok'\n", fp);
+    fclose(fp);
+
+    int code = -1;
+    bool signalled = false;
+    int sig = 0;
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(60); /* a stuck worker dies here instead of hanging the runner */
+        _exit(idx853_supervised_autowatch_check(tmp_dir, cache));
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        signalled = true;
+        sig = WTERMSIG(status);
+    }
+
+    char *project = cbm_project_name_from_path(tmp_dir);
+    cleanup_project_db(cache, project);
+    free(project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    remove(src_path);
+    cbm_rmdir(cache);
+    cbm_rmdir(tmp_dir);
+
+    if (signalled) {
+        printf("    child killed by signal %d (alarm => worker hang)\n", sig);
+    } else if (code != IDX853_OK) {
+        printf("    child exit code %d (61=watcher registered under auto_watch=false=RED, "
+               "62=no spawn, 63=setup fail, 64=bad count)\n",
+               code);
+    }
+    ASSERT_FALSE(signalled);
+    ASSERT_EQ(code, IDX853_OK);
+    PASS();
+#endif
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -4408,6 +4743,7 @@ SUITE(mcp) {
     RUN_TEST(tool_index_repository_reports_store_backed_adr);
     RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
+    RUN_TEST(index_bg_paths_route_through_supervisor_issue832);
     RUN_TEST(tool_manage_adr_not_found_rich_error);
     RUN_TEST(tool_manage_adr_get_accepts_abs_path);
     RUN_TEST(tool_manage_adr_get_accepts_symlink_path);
@@ -4465,4 +4801,5 @@ SUITE(mcp) {
     /* auto_watch gate (distilled from PR #625) */
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
+    RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
 }
