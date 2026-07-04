@@ -54,6 +54,7 @@ enum {
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
+#include "mcp/index_supervisor.h"
 #include "foundation/str_util.h"
 #include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
@@ -3450,7 +3451,253 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     return degraded;
 }
 
+/* Build the response for a worker that crashed/hung/failed without producing a
+ * result. The crash is already contained (this process survived); we report it
+ * rather than dying. Precise skip-and-continue (quarantine the culprit, index the
+ * rest) is layered on in the probe stage. */
+static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome) {
+    char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "error");
+    yyjson_mut_obj_add_str(doc, root, "outcome", cbm_proc_outcome_str(outcome));
+    yyjson_mut_obj_add_str(
+        doc, root, "hint",
+        outcome == CBM_PROC_HANG
+            ? "Indexing worker timed out (a file made no progress). The worker was "
+              "terminated and the server survived. Re-run to retry."
+            : "Indexing worker crashed on a file. The crash was contained (the server "
+              "survived). Re-run to retry; a future release isolates the culprit file.");
+    if (repo_path) {
+        yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
+    }
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    free(repo_path);
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
+    return result;
+}
+
+/* Drop the cached store so the next query reopens whatever the worker wrote (each
+ * worker is a fresh process that deletes + recreates the .db). */
+static void supervisor_invalidate_store(cbm_mcp_server_t *srv) {
+    if (srv->owns_store && srv->store) {
+        cbm_store_close(srv->store);
+        srv->store = NULL;
+    }
+    free(srv->current_project);
+    srv->current_project = NULL;
+}
+
+/* Resolve a per-supervisor-run temp path <cache_dir>/logs/.supervisor-<pid><suffix>
+ * (falls back to the CWD if the cache dir is unresolvable). Used for the crash-
+ * attribution marker and the quarantine list during the recovery re-run. */
+static void supervisor_tmp_path(char *out, size_t out_sz, const char *suffix) {
+    const char *cdir = cbm_resolve_cache_dir();
+    if (cdir && cdir[0]) {
+        char logdir[CBM_SZ_1K];
+        snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
+        cbm_mkdir_p(logdir, 0755);
+        snprintf(out, out_sz, "%s/.supervisor-%d%s", logdir, (int)getpid(), suffix);
+    } else {
+        snprintf(out, out_sz, ".supervisor-%d%s", (int)getpid(), suffix);
+    }
+}
+
+/* Read the single-line crash marker (the rel_path the worker was processing when
+ * it died). Returns a trimmed heap string (caller frees), or NULL when the marker
+ * is empty/unreadable (i.e. the crash could not be attributed to a file). */
+static char *supervisor_read_marker(const char *path) {
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+    char buf[CBM_SZ_1K];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    (void)fclose(f);
+    buf[n] = '\0';
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' || buf[len - 1] == ' ')) {
+        buf[--len] = '\0';
+    }
+    return len > 0 ? cbm_strdup(buf) : NULL;
+}
+
+/* Append one quarantine entry "rel\tphase\n" (phase = "crash"|"hang") to the
+ * quarantine list. The worker's loader parses this back and reports the skip's
+ * phase in skipped[]; a bare "rel" line is still tolerated there (defaults crash). */
+static bool supervisor_append_quarantine(const char *path, const char *rel, const char *phase) {
+    FILE *f = cbm_fopen(path, "ab");
+    if (!f) {
+        return false;
+    }
+    (void)fprintf(f, "%s\t%s\n", rel, phase);
+    (void)fclose(f);
+    return true;
+}
+
+/* Run index_repository in a supervised worker subprocess with skip-and-continue
+ * (Stage 3c). Returns the response string (caller frees):
+ *   - the worker's own response on a clean first run (the common path);
+ *   - after a crash/hang, the response from a clean single-threaded RECOVERY run
+ *     that quarantines the culprit file(s) — status="indexed" with them listed in
+ *     skipped[] as phase="crash"/"hang", and the good files indexed;
+ *   - a best-effort PARTIAL index (one final quarantine-only run) if the recovery
+ *     loop cannot converge but at least one file was quarantined;
+ *   - a contained-failure response only if even that cannot produce a clean run.
+ * Returns NULL only when the worker could not be spawned at all, so the caller
+ * degrades to the in-process path. */
+static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
+    supervisor_invalidate_store(srv);
+
+    /* First attempt: normal parallel run. */
+    cbm_index_worker_result_t wr;
+    int rc = cbm_index_spawn_worker(args, false, NULL, NULL, &wr);
+
+    if (rc != 0 || wr.outcome == CBM_PROC_SPAWN_FAILED) {
+        cbm_index_worker_result_free(&wr);
+        supervisor_invalidate_store(srv);
+        return NULL; /* degrade to in-process */
+    }
+    if (wr.outcome == CBM_PROC_CLEAN) {
+        /* Clean exit → transfer the worker's response (the common path). If the
+         * worker exited clean but wrote no response (a degenerate case, e.g. a
+         * self binary that does not act as an index worker), resp is NULL and the
+         * caller degrades to the in-process path — a clean run never needs the
+         * crash-recovery loop. */
+        char *resp = wr.response; /* transfer ownership to caller (may be NULL) */
+        wr.response = NULL;
+        cbm_index_worker_result_free(&wr);
+        supervisor_invalidate_store(srv);
+        return resp;
+    }
+
+    /* Crash / hang / nonzero exit → skip-and-continue recovery. Re-run the worker
+     * single-threaded with a per-file marker; each time it crashes/hangs the
+     * marker names the exact crasher, which we append to the quarantine file
+     * before re-spawning. A clean single-threaded run then indexes the good files
+     * and reports the quarantined ones as phase="crash" skips (via the ordinary
+     * Stage-2 skip plumbing — no JSON merge needed). */
+    cbm_proc_outcome_t last_outcome = wr.outcome;
+    cbm_index_worker_result_free(&wr);
+
+    char marker_path[CBM_SZ_1K];
+    char quarantine_path[CBM_SZ_1K];
+    supervisor_tmp_path(marker_path, sizeof(marker_path), ".marker");
+    supervisor_tmp_path(quarantine_path, sizeof(quarantine_path), ".quarantine");
+    (void)remove(marker_path);
+    /* Start the quarantine list empty (truncate any stale file). */
+    FILE *qinit = cbm_fopen(quarantine_path, "wb");
+    if (qinit) {
+        (void)fclose(qinit);
+    }
+
+    int cap = 100;
+    const char *cap_env = getenv("CBM_INDEX_MAX_RESTARTS");
+    if (cap_env && cap_env[0]) {
+        int v = atoi(cap_env);
+        if (v > 0) {
+            cap = v;
+        }
+    }
+
+    char *resp = NULL;
+    int quarantined = 0; /* files pinned + added to the quarantine list so far */
+    for (int i = 0; i < cap; i++) {
+        cbm_index_worker_result_t wr2;
+        int rc2 = cbm_index_spawn_worker(args, true, marker_path, quarantine_path, &wr2);
+        if (rc2 != 0) {
+            last_outcome = wr2.outcome;
+            cbm_index_worker_result_free(&wr2);
+            break; /* spawn failed mid-recovery — give up */
+        }
+        if (wr2.outcome == CBM_PROC_CLEAN && wr2.response) {
+            resp = wr2.response; /* transfer ownership to caller */
+            wr2.response = NULL;
+            cbm_index_worker_result_free(&wr2);
+            break; /* good files indexed; quarantined files reported as crash/hang */
+        }
+        if (wr2.outcome == CBM_PROC_CRASH || wr2.outcome == CBM_PROC_HANG) {
+            last_outcome = wr2.outcome;
+            cbm_index_worker_result_free(&wr2);
+            /* crash vs hang: the phase this file is quarantined under and reported
+             * as in skipped[]. A fault signal → "crash"; a no-progress kill →
+             * "hang". */
+            const char *phase = (last_outcome == CBM_PROC_HANG) ? "hang" : "crash";
+            /* Attribute the failure to the file the marker pinned and quarantine it.
+             * If the marker is empty/unreadable we cannot attribute it to a single
+             * file → stop and report a contained failure. */
+            char *crasher = supervisor_read_marker(marker_path);
+            if (!crasher) {
+                cbm_log_warn("index.supervisor.unattributable", "action", "give_up");
+                break;
+            }
+            if (!supervisor_append_quarantine(quarantine_path, crasher, phase)) {
+                cbm_log_warn("index.supervisor.quarantine_write_fail", "path", crasher);
+                free(crasher);
+                break;
+            }
+            quarantined++;
+            char attempt_buf[MCP_FIELD_SIZE];
+            snprintf(attempt_buf, sizeof(attempt_buf), "%d", i + 1);
+            cbm_log_warn("index.file_quarantined", "path", crasher, "outcome", phase, "attempt",
+                         attempt_buf);
+            free(crasher);
+            (void)remove(marker_path); /* fresh marker for the next re-run */
+            continue;
+        }
+        /* SPAWN_FAILED / nonzero exit / non-fault kill → not a crash we can
+         * attribute; stop and report a contained failure. */
+        last_outcome = wr2.outcome;
+        cbm_index_worker_result_free(&wr2);
+        break;
+    }
+
+    (void)remove(marker_path); /* marker no longer needed */
+
+    /* Terminal best-effort-partial: the loop exited WITHOUT a clean run (cap
+     * exhausted, or an unattributable failure) but at least one file was already
+     * quarantined. Try ONE final single-threaded spawn with the accumulated
+     * quarantine and NO marker — every known-bad file short-circuits, so a clean
+     * run yields a PARTIAL index (all good files indexed, all known crashers/hangs
+     * reported as skips) rather than a hard failure. Bounded by the same quiet-
+     * timeout, so it cannot itself hang. Rare given monotonic progress. */
+    if (!resp && quarantined > 0) {
+        cbm_index_worker_result_t wrp;
+        int rcp = cbm_index_spawn_worker(args, true, NULL, quarantine_path, &wrp);
+        if (rcp == 0 && wrp.outcome == CBM_PROC_CLEAN && wrp.response) {
+            resp = wrp.response; /* transfer ownership to caller */
+            wrp.response = NULL;
+            char qn[MCP_FIELD_SIZE];
+            snprintf(qn, sizeof(qn), "%d", quarantined);
+            cbm_log_error("index.supervisor.partial", "quarantined", qn, "outcome",
+                          cbm_proc_outcome_str(last_outcome));
+        }
+        cbm_index_worker_result_free(&wrp);
+    }
+
+    (void)remove(quarantine_path);
+    supervisor_invalidate_store(srv);
+
+    if (resp) {
+        return resp;
+    }
+    return build_worker_failure_response(args, last_outcome);
+}
+
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
+    /* Supervisor gate: run the index in a crash/hang-isolating worker subprocess
+     * unless this process IS the worker or the kill switch (CBM_INDEX_SUPERVISOR=0)
+     * is set. On spawn failure, fall through to the in-process path (degrade). */
+    if (cbm_index_supervisor_should_wrap()) {
+        char *supervised = index_run_supervised(srv, args);
+        if (supervised) {
+            return supervised;
+        }
+    }
+
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
