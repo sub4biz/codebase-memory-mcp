@@ -492,6 +492,8 @@ export CBM_CACHE_DIR=~/my-projects/cbm-data
 
 The JSON config files support a single key, `extra_extensions`, which maps additional file extensions to supported languages. Useful for framework-specific extensions like `.blade.php` (Laravel) or `.mjs` (ES modules). (For other tunables, see [Environment Variables](#environment-variables) and the `config` subcommand above.)
 
+Need the full config-file reference? See [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
 **Per-project** (in your repo root):
 ```json
 // .codebase-memory.json
