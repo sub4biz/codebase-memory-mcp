@@ -5381,8 +5381,12 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         base_branch = heap_strdup("main");
     }
 
-    /* Reject shell metacharacters in user-supplied branch name */
-    if (!cbm_validate_shell_arg(base_branch)) {
+    /* Reject shell metacharacters, and a leading '-', in the user-supplied
+     * branch name. base_branch is spliced into `git diff --name-only
+     * "<base>"...HEAD`; a value starting with '-' would be read by git as an
+     * option rather than a ref (e.g. `--output=<path>` writes the diff to an
+     * arbitrary file). A real git ref never begins with '-'. */
+    if (!cbm_validate_shell_arg(base_branch) || base_branch[0] == '-') {
         free(project);
         free(base_branch);
         free(scope);

@@ -4912,12 +4912,30 @@ TEST(mcp_path_within_root_rejects_escape) {
 #endif
 }
 
+/* base_branch is spliced into a `git diff --name-only "<base>"...HEAD` command;
+ * a value starting with '-' would be taken by git as an option (e.g.
+ * --output=<path> writes the diff to an arbitrary file) rather than a ref. It
+ * must be rejected up front, alongside the shell-metacharacter check. */
+TEST(detect_changes_rejects_option_like_base_branch) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"detect_changes\","
+             "\"arguments\":{\"project\":\"p\",\"base_branch\":\"--output=/tmp/cbm_pwn\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "invalid characters"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(mcp) {
     RUN_TEST(mcp_path_within_root_rejects_escape);
+    RUN_TEST(detect_changes_rejects_option_like_base_branch);
     /* JSON-RPC parsing */
     RUN_TEST(jsonrpc_parse_request);
     RUN_TEST(jsonrpc_parse_notification);
