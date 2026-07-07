@@ -3018,21 +3018,40 @@ TEST(cli_print_tool_help_issue680) {
  * Guard the digest itself against a known vector. */
 extern int cbm_cli_sha256_file(const char *path, char *out, size_t out_size);
 
-TEST(cli_sha256_file_matches_known_vector) {
+/* Hash `content` (len bytes) via a temp file and compare to expected hex.
+ * Returns 1 on match, 0 otherwise. */
+static int sha256_vector_ok(const void *content, size_t len, const char *expected) {
     char path[512];
     snprintf(path, sizeof(path), "%s/cbm_sha_XXXXXX", cbm_tmpdir());
     int fd = cbm_mkstemp(path);
-    ASSERT_TRUE(fd >= 0);
+    if (fd < 0) {
+        return 0;
+    }
     FILE *fp = fdopen(fd, "wb");
-    ASSERT_NOT_NULL(fp);
-    fwrite("abc", 1, 3, fp); /* sha256("abc") is a NIST test vector */
+    if (!fp) {
+        return 0;
+    }
+    if (len > 0) {
+        fwrite(content, 1, len, fp);
+    }
     fclose(fp);
 
     char digest[128] = {0};
     int rc = cbm_cli_sha256_file(path, digest, sizeof(digest));
     remove(path);
-    ASSERT_EQ(rc, 0);
-    ASSERT_STR_EQ(digest, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    return rc == 0 && strcmp(digest, expected) == 0;
+}
+
+/* NIST FIPS 180-4 SHA-256 test vectors: empty input, a single block ("abc"),
+ * and a 56-byte input that forces the length padding into a second block. */
+TEST(cli_sha256_file_matches_known_vector) {
+    ASSERT_TRUE(sha256_vector_ok(
+        "", 0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    ASSERT_TRUE(sha256_vector_ok(
+        "abc", 3, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    ASSERT_TRUE(sha256_vector_ok(
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 56,
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"));
     PASS();
 }
 
