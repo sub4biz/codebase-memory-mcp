@@ -104,7 +104,14 @@ The `install` command auto-detects all installed coding agents and configures MC
 
 ### Graph Visualization UI
 
-If you downloaded the `ui` variant:
+The UI ships as a separate `ui` build (it embeds the frontend). The default install on every channel is the lean, headless server; opt into the UI build with:
+
+- **install.sh:** add `--ui` (see [Quick Start](#quick-start))
+- **npm:** `CBM_VARIANT=ui npm install -g codebase-memory-mcp`
+- **PyPI:** `CBM_VARIANT=ui pip install codebase-memory-mcp`
+- **Manual:** download the `codebase-memory-mcp-ui-<os>-<arch>` archive
+
+Then run it:
 
 ```bash
 codebase-memory-mcp --ui=true --port=9749
@@ -476,6 +483,7 @@ codebase-memory-mcp config reset auto_index              # reset to default
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `CBM_ALLOWED_ROOT` | *(unset)* | Restrict `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused; unset imposes no restriction. Useful when the server may be driven by an untrusted caller, e.g. agentic or multi-tenant deployments. |
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the database storage directory. All project indexes and config are stored here. |
 | `CBM_DIAGNOSTICS` | `false` | Set to `1` or `true` to enable periodic diagnostics output to `/tmp/cbm-diagnostics-<pid>.json`. |
 | `CBM_DOWNLOAD_URL` | *(GitHub releases)* | Override the download URL for updates. Used for testing or self-hosted deployments. |
