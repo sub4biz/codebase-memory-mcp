@@ -19,6 +19,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/* Sleep before rewriting a fixture so its mtime_ns strictly increases and the
+ * incremental change classifier reliably sees the edit (10 ms). */
+#define INCR_FIX_SLEEP_NS 10000000L
 
 /* ── Local helpers ──────────────────────────────────────────────── */
 
@@ -358,34 +363,53 @@ TEST(index_parse_partial_reported) {
     ASSERT_NOT_NULL(strstr(logtext, "split.c"));
     free(logtext);
 
-    /* The File node carries the queryable marker. */
-    cbm_node_t *nodes = NULL;
-    int count = 0;
-    int rc = cbm_store_find_nodes_by_qn_suffix(store, lp.project, "__file__", &nodes, &count);
-    ASSERT_EQ(rc, CBM_STORE_OK);
+    /* The signal is persisted in the SEPARATE index_coverage table (never
+     * mixed into the graph tables) and queryable via get_index_coverage,
+     * exactly as the index_repository tool description advertises. */
+    cbm_coverage_row_t *rows = NULL;
+    int cov_count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(store, lp.project, &rows, &cov_count), CBM_STORE_OK);
     int marked = 0;
-    for (int i = 0; i < count; i++) {
-        if (nodes[i].file_path && strstr(nodes[i].file_path, "split.c")) {
-            ASSERT_NOT_NULL(nodes[i].properties_json);
-            ASSERT_NOT_NULL(strstr(nodes[i].properties_json, "\"parse_incomplete\":true"));
-            ASSERT_NOT_NULL(strstr(nodes[i].properties_json, "\"error_ranges\":\""));
+    for (int i = 0; i < cov_count; i++) {
+        if (rows[i].rel_path && strstr(rows[i].rel_path, "split.c")) {
+            ASSERT_NOT_NULL(rows[i].kind);
+            ASSERT_STR_EQ("parse_partial", rows[i].kind);
+            ASSERT_NOT_NULL(rows[i].detail);
+            ASSERT_GT((int)strlen(rows[i].detail), 0);
             marked = 1;
         }
     }
-    cbm_store_free_nodes(nodes, count);
+    cbm_store_free_coverage(rows, cov_count);
     ASSERT_TRUE(marked);
 
-    /* The marker is queryable exactly as the index_repository tool description
-     * advertises (agents are pointed at this query to find unindexed code). */
     char qargs[900];
-    snprintf(qargs, sizeof(qargs),
-             "{\"project\":\"%s\",\"query\":\"MATCH (f:File) WHERE f.parse_incomplete = true "
-             "RETURN f.file_path, f.error_ranges\"}",
-             lp.project);
-    char *qresp = cbm_mcp_handle_tool(lp.srv, "query_graph", qargs);
+    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\"}", lp.project);
+    char *qresp = cbm_mcp_handle_tool(lp.srv, "get_index_coverage", qargs);
     ASSERT_NOT_NULL(qresp);
     ASSERT_NOT_NULL(strstr(qresp, "split.c"));
+    ASSERT_NOT_NULL(strstr(qresp, "parse_partial"));
     free(qresp);
+
+    /* The miss GRAPH: the same signal is queryable as a file-structure graph
+     * via query_graph(graph="coverage") — exactly the query the tool
+     * description advertises — and it lives under the shadow project, so the
+     * REAL code graph gained no coverage rows. */
+    snprintf(qargs, sizeof(qargs),
+             "{\"project\":\"%s\",\"graph\":\"coverage\",\"query\":\"MATCH (f:File) WHERE "
+             "f.kind = \\\"parse_partial\\\" RETURN f.file_path, f.detail\"}",
+             lp.project);
+    char *gresp = cbm_mcp_handle_tool(lp.srv, "query_graph", qargs);
+    ASSERT_NOT_NULL(gresp);
+    ASSERT_NOT_NULL(strstr(gresp, "split.c"));
+    free(gresp);
+    snprintf(qargs, sizeof(qargs),
+             "{\"project\":\"%s\",\"query\":\"MATCH (f:File) WHERE f.kind = "
+             "\\\"parse_partial\\\" RETURN f.file_path\"}",
+             lp.project);
+    char *cresp = cbm_mcp_handle_tool(lp.srv, "query_graph", qargs);
+    ASSERT_NOT_NULL(cresp);
+    ASSERT_NULL(strstr(cresp, "split.c")); /* code graph: no coverage rows */
+    free(cresp);
 
     /* Clean neighbors still extract. */
     int funcs = rh_count_label(store, lp.project, "Function");
@@ -397,8 +421,70 @@ TEST(index_parse_partial_reported) {
     PASS();
 }
 
+/* INV(parse-partial-clears-on-fix, #963): the persisted coverage signal must
+ * stay FRESH — after the broken file is fixed and the project re-indexed
+ * (incremental route: the DB already exists), its parse_partial row is gone
+ * and get_index_coverage reports it no longer. A stale flag on a fixed file
+ * would make the whole signal untrustworthy. */
+TEST(index_parse_partial_clears_on_fix) {
+    RProj lp;
+    memset(&lp, 0, sizeof(lp));
+    snprintf(lp.tmpdir, sizeof(lp.tmpdir), "/tmp/cbm_resil_XXXXXX");
+    if (!cbm_mkdtemp(lp.tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    rh_to_fwd_slashes(lp.tmpdir);
+
+    ri_write_text(lp.tmpdir, "flaky.py", "def ok():\n    return 1\n\ndef broken(:\n    pass\n");
+    ri_write_text(lp.tmpdir, "good.py", "def alpha():\n    return 1\n");
+
+    char *resp = NULL;
+    cbm_store_t *store = ri_index_capture(&lp, &resp);
+    if (!resp) {
+        FAIL("no MCP response");
+    }
+    free(resp);
+    if (!store) {
+        FAIL("store did not open");
+    }
+    cbm_store_close(store);
+
+    /* Flagged after the first (full) index. */
+    char qargs[900];
+    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\"}", lp.project);
+    char *cov1 = cbm_mcp_handle_tool(lp.srv, "get_index_coverage", qargs);
+    ASSERT_NOT_NULL(cov1);
+    ASSERT_NOT_NULL(strstr(cov1, "flaky.py"));
+    free(cov1);
+
+    /* Fix the file; ensure a newer mtime so change detection can't miss it. */
+    struct timespec ts = {0, INCR_FIX_SLEEP_NS};
+    nanosleep(&ts, NULL);
+    ri_write_text(lp.tmpdir, "flaky.py", "def ok():\n    return 1\n\ndef fixed():\n    return 2\n");
+
+    /* Re-index WITHOUT deleting the DB → routes through the incremental path. */
+    char iargs[700];
+    snprintf(iargs, sizeof(iargs), "{\"repo_path\":\"%s\"}", lp.tmpdir);
+    char *resp2 = cbm_mcp_handle_tool(lp.srv, "index_repository", iargs);
+    ASSERT_NOT_NULL(resp2);
+    free(resp2);
+
+    char *cov2 = cbm_mcp_handle_tool(lp.srv, "get_index_coverage", qargs);
+    ASSERT_NOT_NULL(cov2);
+    ASSERT_NULL(strstr(cov2, "flaky.py"));
+    free(cov2);
+
+    store = cbm_store_open_path(lp.dbpath);
+    if (!store) {
+        FAIL("store did not reopen");
+    }
+    rh_cleanup(&lp, store);
+    PASS();
+}
+
 SUITE(index_resilience) {
     RUN_TEST(index_oversized_file_reported);
     RUN_TEST(index_clean_run_no_logfile);
     RUN_TEST(index_parse_partial_reported);
+    RUN_TEST(index_parse_partial_clears_on_fix);
 }

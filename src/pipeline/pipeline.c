@@ -315,40 +315,6 @@ void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **ou
     }
 }
 
-void cbm_pipeline_stamp_parse_partial(cbm_pipeline_t *p, cbm_gbuf_t *gbuf) {
-    if (!p || !gbuf) {
-        return;
-    }
-    int stamped = 0;
-    for (int i = 0; i < p->file_errors_count; i++) {
-        const cbm_file_error_t *e = &p->file_errors[i];
-        if (!e->path || !e->phase || strcmp(e->phase, "parse_partial") != 0) {
-            continue;
-        }
-        char *file_qn = cbm_pipeline_fqn_compute(p->project_name, e->path, "__file__");
-        if (!file_qn) {
-            continue;
-        }
-        const char *slash = strrchr(e->path, '/');
-        const char *basename = slash ? slash + SKIP_ONE : e->path;
-        const char *ext = strrchr(basename, '.');
-        /* Full replacement props (set_node_props does not merge): keep the
-         * "extension" key pass_structure wrote, add the coverage marker. The
-         * ranges string is digits/commas/dashes — JSON-safe unescaped. */
-        char props[CBM_SZ_2K];
-        snprintf(props, sizeof(props),
-                 "{\"extension\":\"%s\",\"parse_incomplete\":true,\"error_ranges\":\"%s\"}",
-                 ext ? ext : "", e->reason ? e->reason : "");
-        if (cbm_gbuf_set_node_props(gbuf, file_qn, props)) {
-            stamped++;
-        }
-        free(file_qn);
-    }
-    if (stamped > 0) {
-        cbm_log_info("index.parse_partial", "files", itoa_buf(stamped));
-    }
-}
-
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges) {
     if (nodes) {
         *nodes = p ? p->committed_nodes : -1;
@@ -1148,6 +1114,29 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         }
         CBM_PROF_END_N("persist", "4_file_hashes", t_fh, file_count);
 
+        /* Coverage rows (#963): a full run's file_errors is the complete
+         * coverage truth for the project. The dump recreated the DB file, so
+         * the separate index_coverage table starts empty — write only when
+         * there is something to record (AFTER hashes, so the deleted-file
+         * prune inside replace sees the live file set). */
+        if (p->file_errors_count > 0) {
+            cbm_coverage_row_t *cov =
+                (cbm_coverage_row_t *)malloc((size_t)p->file_errors_count * sizeof(*cov));
+            if (cov) {
+                for (int i = 0; i < p->file_errors_count; i++) {
+                    cov[i].rel_path = p->file_errors[i].path;
+                    cov[i].kind = p->file_errors[i].phase;
+                    cov[i].detail = p->file_errors[i].reason;
+                }
+                if (cbm_store_coverage_replace(hash_store, p->project_name, cov,
+                                               p->file_errors_count) != CBM_STORE_OK) {
+                    cbm_log_error("pipeline.err", "phase", "persist_coverage", "project",
+                                  p->project_name);
+                }
+                free(cov);
+            }
+        }
+
         /* FTS5 backfill: populate nodes_fts with camelCase-split names.
          * Contentless FTS5 requires the special 'delete-all' command instead of
          * DELETE FROM to wipe prior rows (there's no underlying content table).
@@ -1295,11 +1284,6 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBM_PROF_END_N("pipeline", "2_extraction_total", t_extract_total, file_count);
     if (check_cancel(p)) {
         return CBM_NOT_FOUND;
-    }
-    if (rc == 0) {
-        /* Extraction merged its per-file errors — stamp parse-partial File
-         * nodes (#963) before downstream passes and the dump. */
-        cbm_pipeline_stamp_parse_partial(p, p->gbuf);
     }
     return rc;
 }

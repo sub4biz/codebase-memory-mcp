@@ -319,11 +319,10 @@ static const tool_def_t TOOLS[] = {
      "Requires target_projects param. Ensure target projects have fresh indexes first. "
      "COVERAGE: the response reports files that were NOT fully indexed — 'skipped' (not "
      "indexed at all: oversized/read/parse failures) and 'parse_partial' (indexed, but "
-     "constructs inside the listed line ranges could not be parsed and are absent from the "
-     "graph). parse_partial files also carry {parse_incomplete:true, error_ranges} on their "
-     "File node — query later via query_graph: MATCH (f:File) WHERE f.parse_incomplete = true "
-     "RETURN f. Both signals are best-effort: absence of a flag is NOT a completeness "
-     "guarantee; prefer grep inside flagged ranges.",
+     "constructs inside the listed line ranges could not be parsed and MAY be missing from "
+     "the graph). Query the persisted signal any time via the get_index_coverage tool or "
+     "structurally via query_graph(graph=\"coverage\"). Both signals are best-effort: absence "
+     "of a flag is NOT a completeness guarantee; prefer grep inside flagged ranges.",
      "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
      "\"Path to the repository\"},"
      "\"mode\":{\"type\":\"string\","
@@ -395,9 +394,20 @@ static const tool_def_t TOOLS[] = {
      "no conditionally-guarded base case), param_count and max_access_depth (structure smells). "
      "Find all hot-path candidates in one query, e.g. MATCH (f:Function) WHERE "
      "f.transitive_loop_depth >= 3 OR f.linear_scan_in_loop >= 1 RETURN f.qualified_name, "
-     "f.transitive_loop_depth, f.linear_scan_in_loop ORDER BY f.transitive_loop_depth DESC.",
+     "f.transitive_loop_depth, f.linear_scan_in_loop ORDER BY f.transitive_loop_depth DESC. "
+     "COVERAGE GRAPH: pass graph=\"coverage\" to query the best-effort miss graph instead — "
+     "the file structure of files the indexer could NOT fully cover (Project → Folder → "
+     "File nodes with CONTAINS_FOLDER/CONTAINS_FILE edges; each File carries kind "
+     "(\"parse_partial\" = indexed but constructs in the flagged line ranges MAY be missing; "
+     "or a skip phase) and detail (the line ranges / reason)). Example: MATCH (f:File) WHERE "
+     "f.kind = \\\"parse_partial\\\" RETURN f.file_path, f.detail. Absence from this graph is "
+     "NOT a completeness guarantee.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
-     "query\"},\"project\":{\"type\":\"string\"},\"max_rows\":{\"type\":\"integer\","
+     "query\"},\"project\":{\"type\":\"string\"},"
+     "\"graph\":{\"type\":\"string\",\"enum\":[\"code\",\"coverage\"],\"default\":\"code\","
+     "\"description\":\"Which graph to query: the code knowledge graph (default) or the "
+     "indexing-coverage miss graph (files not fully indexed, as a file-structure graph).\"},"
+     "\"max_rows\":{\"type\":\"integer\","
      "\"description\":"
      "\"Optional row limit. Default: unlimited up to a 100k row "
      "ceiling. No offset support — use search_graph for paginated browsing.\"}},"
@@ -486,6 +496,18 @@ static const tool_def_t TOOLS[] = {
      "\"project\"]}"},
 
     {"index_status", "Index status", "Get the indexing status of a project",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
+     "\"project\"]}"},
+
+    {"get_index_coverage", "Index coverage",
+     "Report which files the indexer could NOT fully cover (best-effort signal, #963): "
+     "'parse_partial' files WERE indexed but contain line ranges tree-sitter could not parse — "
+     "constructs there MAY be missing from the graph (some are still recovered); 'skipped' files "
+     "were not indexed at all (oversized/read/parse failure). Use this before trusting graph "
+     "completeness on a file: if a file is listed, ALSO grep it (especially the flagged ranges). "
+     "IMPORTANT: absence from this list is NOT a completeness guarantee — the signal only marks "
+     "what the indexer can detect. For structural queries over the misses use "
+     "query_graph(graph=\"coverage\").",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
      "\"project\"]}"},
 
@@ -2065,9 +2087,20 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolve_store(srv, project);
     int max_rows = cbm_mcp_get_int_arg(args, "max_rows", 0);
 
+    /* graph="coverage" (#963): run the SAME cypher against the derived
+     * miss-graph view (shadow project "<project>::coverage") instead of the
+     * code graph — file structure of not-fully-indexed files only. */
+    char *graph_arg = cbm_mcp_get_string_arg(args, "graph");
+    bool coverage_graph = graph_arg && strcmp(graph_arg, "coverage") == 0;
+    free(graph_arg);
+
     if (!query) {
         free(project);
         return cbm_mcp_text_result("query is required", true);
+    }
+    if (coverage_graph && !project) {
+        free(query);
+        return cbm_mcp_text_result("project is required when graph=\"coverage\"", true);
     }
     if (!store) {
         char *_err = build_project_list_error("project not found or not indexed");
@@ -2085,8 +2118,15 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         return not_indexed;
     }
 
+    char covproj[CBM_SZ_512];
+    const char *cypher_project = project;
+    if (coverage_graph) {
+        cbm_store_coverage_shadow_project(covproj, sizeof(covproj), project);
+        cypher_project = covproj;
+    }
+
     cbm_cypher_result_t result = {0};
-    int rc = cbm_cypher_execute(store, query, project, max_rows, &result);
+    int rc = cbm_cypher_execute(store, query, cypher_project, max_rows, &result);
 
     if (rc < 0) {
         char *err_msg = result.error ? result.error : "query execution failed";
@@ -2168,6 +2208,87 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
                 doc, root, "hint",
                 "Project is empty. Re-run index_repository(repo_path=...) to populate.");
         }
+    } else {
+        yyjson_mut_obj_add_str(doc, root, "status", "no_project");
+    }
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    free(project);
+
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
+/* get_index_coverage (#963): report the best-effort indexing-coverage signal
+ * from the separate index_coverage table (coverage is metadata ABOUT the
+ * graph, stored outside it). Full per-project list, capped generously. */
+enum { COVERAGE_FILE_CAP = 500 };
+
+static char *handle_get_index_coverage(cbm_mcp_server_t *srv, const char *args) {
+    char *project = get_project_arg(args);
+    cbm_store_t *store = resolve_store(srv, project);
+    REQUIRE_STORE(store, project);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    if (project) {
+        yyjson_mut_obj_add_str(doc, root, "project", project);
+        cbm_coverage_row_t *rows = NULL;
+        int count = 0;
+        (void)cbm_store_coverage_get(store, project, &rows, &count);
+
+        yyjson_mut_val *pp_files = yyjson_mut_arr(doc);
+        yyjson_mut_val *sk_files = yyjson_mut_arr(doc);
+        int pp_n = 0;
+        int sk_n = 0;
+        for (int i = 0; i < count; i++) {
+            bool partial = rows[i].kind && strcmp(rows[i].kind, "parse_partial") == 0;
+            if (partial) {
+                if (pp_n < COVERAGE_FILE_CAP) {
+                    yyjson_mut_val *fe = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
+                    yyjson_mut_obj_add_strcpy(doc, fe, "error_ranges",
+                                              rows[i].detail ? rows[i].detail : "");
+                    yyjson_mut_arr_add_val(pp_files, fe);
+                }
+                pp_n++;
+            } else {
+                if (sk_n < COVERAGE_FILE_CAP) {
+                    yyjson_mut_val *fe = yyjson_mut_obj(doc);
+                    yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
+                    yyjson_mut_obj_add_strcpy(doc, fe, "reason",
+                                              rows[i].detail ? rows[i].detail : "");
+                    yyjson_mut_obj_add_strcpy(doc, fe, "phase", rows[i].kind ? rows[i].kind : "");
+                    yyjson_mut_arr_add_val(sk_files, fe);
+                }
+                sk_n++;
+            }
+        }
+        cbm_store_free_coverage(rows, count);
+
+        yyjson_mut_val *pp = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_val(doc, pp, "files", pp_files);
+        yyjson_mut_obj_add_int(doc, pp, "count", pp_n);
+        yyjson_mut_obj_add_bool(doc, pp, "truncated", pp_n > COVERAGE_FILE_CAP);
+        yyjson_mut_obj_add_val(doc, root, "parse_partial", pp);
+
+        yyjson_mut_val *sk = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_val(doc, sk, "files", sk_files);
+        yyjson_mut_obj_add_int(doc, sk, "count", sk_n);
+        yyjson_mut_obj_add_bool(doc, sk, "truncated", sk_n > COVERAGE_FILE_CAP);
+        yyjson_mut_obj_add_val(doc, root, "skipped", sk);
+
+        yyjson_mut_obj_add_str(
+            doc, root, "note",
+            "Best-effort signal, not a completeness guarantee: parse_partial files WERE indexed, "
+            "but constructs inside the listed line ranges (1-based) MAY be missing from the graph "
+            "(tree-sitter error recovery still salvages some). skipped files were not indexed at "
+            "all. Prefer text search (grep) for flagged files/ranges. Files absent from this list "
+            "are NOT guaranteed to be fully indexed.");
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "no_project");
     }
@@ -3396,9 +3517,10 @@ static void add_parse_partial_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_str(doc, pp, "note",
                            "Best-effort signal, not a completeness guarantee: these files WERE "
                            "indexed, but constructs inside the listed line ranges (1-based) could "
-                           "not be parsed and are missing from the graph. Prefer text search "
-                           "(grep) for those regions. Files absent from this list are NOT "
-                           "guaranteed to be fully indexed.");
+                           "not be parsed and MAY be missing from the graph (tree-sitter error "
+                           "recovery still salvages some). Prefer text search (grep) for those "
+                           "regions. Files absent from this list are NOT guaranteed to be fully "
+                           "indexed. Query the persisted signal via get_index_coverage.");
     yyjson_mut_obj_add_val(doc, root, "parse_partial", pp);
 }
 
@@ -5855,6 +5977,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "query_graph") == 0) {
         return handle_query_graph(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_index_coverage") == 0) {
+        return handle_get_index_coverage(srv, args_json);
     }
     if (strcmp(tool_name, "index_status") == 0) {
         return handle_index_status(srv, args_json);

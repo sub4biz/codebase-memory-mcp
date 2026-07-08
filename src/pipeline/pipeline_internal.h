@@ -520,14 +520,6 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb);
 
 /* ── Pass function prototypes ────────────────────────────────────── */
 
-/* Stamp File nodes for files recorded under phase "parse_partial" (#963):
- * sets properties {"extension":...,"parse_incomplete":true,"error_ranges":...}
- * on the (already-existing) File node so the coverage signal is queryable in
- * the graph. Call after the extraction pass has merged its per-file errors —
- * both the full path (pipeline.c) and the incremental path
- * (pipeline_incremental.c) must call it. Implementation: pipeline.c. */
-void cbm_pipeline_stamp_parse_partial(cbm_pipeline_t *p, cbm_gbuf_t *gbuf);
-
 int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count);
 
