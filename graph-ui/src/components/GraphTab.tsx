@@ -22,6 +22,7 @@ import {
 import { Sidebar } from "./Sidebar";
 import { FilterPanel } from "./FilterPanel";
 import { NodeDetailPanel } from "./NodeDetailPanel";
+import { MissedCallout } from "./MissedCallout";
 import { ResizeHandle } from "./ResizeHandle";
 import { ErrorBoundary } from "./ErrorBoundary";
 import type { GraphNode, GraphData, RepoInfo } from "../lib/types";
@@ -556,19 +557,34 @@ export function GraphTab({ project }: GraphTabProps) {
             className="border-l border-border shrink-0 h-full overflow-hidden"
             style={{ width: rightWidth, maxHeight: "100%" }}
           >
-            <NodeDetailPanel
-              node={selectedNode}
-              allNodes={filteredData.nodes}
-              allEdges={filteredData.edges}
-              project={project}
-              repoInfo={repoInfo}
-              onClose={() => {
-                setSelectedNode(null);
-                setHighlightedIds(null);
-                setSelectedPath(null);
-              }}
-              onNavigate={handleNavigateToNode}
-            />
+            {missedSkeleton?.ids.has(selectedNode.id) ? (
+              /* Skeleton node: the standard panel (code snippet, callers) is
+               * meaningless for a not-fully-indexed file — show the coverage
+               * callout with its report-the-edge-case actions instead. */
+              <MissedCallout
+                node={selectedNode}
+                project={project}
+                onClose={() => {
+                  setSelectedNode(null);
+                  setHighlightedIds(null);
+                  setSelectedPath(null);
+                }}
+              />
+            ) : (
+              <NodeDetailPanel
+                node={selectedNode}
+                allNodes={filteredData.nodes}
+                allEdges={filteredData.edges}
+                project={project}
+                repoInfo={repoInfo}
+                onClose={() => {
+                  setSelectedNode(null);
+                  setHighlightedIds(null);
+                  setSelectedPath(null);
+                }}
+                onNavigate={handleNavigateToNode}
+              />
+            )}
           </div>
         </>
       )}
