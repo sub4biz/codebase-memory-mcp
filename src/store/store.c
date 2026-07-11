@@ -61,6 +61,7 @@ enum {
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "store/store.h"
+#include "foundation/compat_fs.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "foundation/log.h"
@@ -1120,9 +1121,12 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     sqlite3_exec(dest_db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
     sqlite3_close(dest_db);
 
-    /* Atomic rename: old WAL/SHM become stale and get recreated by
-     * the next reader's configure_pragmas call. */
-    if (rename(tmp_path, dest_path) != 0) {
+    /* Remove the DESTINATION's leftover sidecars before installing: a
+     * stale WAL from a crashed session would be replayed on top of the
+     * fresh file at the next open — SQLite validates the WAL against its
+     * own header/checksums, not against the main file (#897). */
+    cbm_remove_db_sidecars(dest_path);
+    if (cbm_rename_replace(tmp_path, dest_path) != 0) {
         store_set_error(s, "dump: rename failed");
         (void)unlink(tmp_path);
         return CBM_STORE_ERR;

@@ -710,7 +710,11 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
 
     cbm_store_close(store);
 
-    /* Atomic rename to final path */
+    /* Atomic rename to final path. Drop the DESTINATION's leftover
+     * -wal/-shm first: the import cleans the tmp file's sidecars, but a
+     * stale WAL next to the cache path would be replayed on top of the
+     * imported file at the next open (#897). */
+    cbm_remove_db_sidecars(cache_db_path);
     if (rename(tmp_path, cache_db_path) != 0) {
         cbm_log_error("artifact.import", "err", "rename_to_cache");
         cbm_unlink(tmp_path);
